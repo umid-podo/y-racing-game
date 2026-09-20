@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>레이싱 게임</title>
+<link rel="icon" href="data:,">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Jua&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<section id="title" class="screen clear">
+  <h1>레이싱 게임</h1>
+  <button id="btnStart" class="big">시작</button>
+</section>
+
+<section id="select" class="screen clear hidden">
+  <div class="card">
+    <h2>인원수를 선택하세요.</h2>
+    <div id="counts" class="counts">
+      <button data-n="2">2명</button>
+      <button data-n="3">3명</button>
+      <button data-n="4">4명</button>
+      <button data-n="5">5명</button>
+      <button data-n="6">6명</button>
+    </div>
+    <p id="phoneNote" class="note hidden">휴대폰에서는 조작 공간이 좁아요. 2명을 권장해요.</p>
+    <button id="btnSelect" class="big">선택</button>
+  </div>
+</section>
+
+<section id="ready" class="screen hidden">
+  <div class="card">
+    <h2>레이스 준비</h2>
+    <ul class="howto">
+      <li>내 색깔 <b>터치 화면</b>에 손가락을 대면 동그라미가 생기고, 카트가 그곳으로 가요.</li>
+      <li>모두 <b>같은 길</b>을 달려요. 아이템은 먼저 밟은 사람이 가져가요.</li>
+      <li><b>≫ 부스터</b>를 밟으면 빨라져요.</li>
+      <li><b>✸ 공격 칸</b>을 밟고 상대 번호를 누르면 공격! 날아오는 공격은 피하세요.</li>
+      <li>1000m에 먼저 도착하면 승리!</li>
+    </ul>
+    <button id="btnGo" class="big">시작</button>
+  </div>
+</section>
+
+<section id="pause" class="screen hidden">
+  <div class="card">
+    <h2>잠깐 멈춤</h2>
+    <div class="row">
+      <button id="btnResume" class="big">계속하기</button>
+      <button id="btnPauseTitle" class="sub">타이틀</button>
+    </div>
+  </div>
+</section>
+
+<section id="result" class="screen hidden">
+  <div class="card">
+    <h2 id="resultTitle"></h2>
+    <ol id="resultList"></ol>
+    <p class="note">Win = 이번 세션 누적 승수</p>
+    <div class="row">
+      <button id="btnAgain" class="big">다시하기</button>
+      <button id="btnResultTitle" class="sub">타이틀</button>
+    </div>
+  </div>
+</section>
+
+<section id="confirm" class="screen hidden">
+  <div class="card">
+    <h2>타이틀로 돌아갈까요?</h2>
+    <p class="note">승수가 모두 초기화돼요.</p>
+    <div class="row">
+      <button id="btnConfirmNo" class="big">취소</button>
+      <button id="btnConfirmYes" class="sub">돌아가기</button>
+    </div>
+  </div>
+</section>
+
+<script src="game.js"></script>
+</body>
+</html>
