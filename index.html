@@ -41,8 +41,9 @@
     <ul class="howto">
       <li>내 색깔 <b>터치 화면</b>에 손가락을 대면 동그라미가 생기고, 카트가 그곳으로 가요.</li>
       <li>모두 <b>같은 길</b>을 달려요. 아이템은 먼저 밟은 사람이 가져가요.</li>
-      <li><b>≫ 부스터</b>를 밟으면 빨라져요.</li>
+      <li><b>≫ 부스터</b>를 밟으면 빨라져요. 1등은 못 먹어요.</li>
       <li><b>✸ 공격 칸</b>을 밟고 상대 번호를 누르면 공격! 날아오는 공격은 피하세요.</li>
+      <li><b>레이저 칸</b>을 밟고 발사 버튼을 누르면 내 줄을 따라 끝까지 광선이 날아가요. 맞으면 느려져요.</li>
       <li>1000m에 먼저 도착하면 승리!</li>
     </ul>
     <button id="btnGo" class="big">시작</button>
@@ -59,10 +60,10 @@
   </div>
 </section>
 
-<section id="result" class="screen hidden">
-  <div class="card">
-    <h2 id="resultTitle"></h2>
-    <ol id="resultList"></ol>
+<!-- 시상대는 캔버스에 그리고, 여기에는 제목과 버튼만 둔다. -->
+<section id="result" class="screen clear hidden">
+  <h2 id="resultTitle"></h2>
+  <div class="bottom">
     <p class="note">Win = 이번 세션 누적 승수</p>
     <div class="row">
       <button id="btnAgain" class="big">다시하기</button>

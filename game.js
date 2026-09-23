@@ -9,7 +9,9 @@ const CONFIG = {
   slowMul: 0.6,
   slowTime: 3,
   protectTime: 1,
-  warnTime: 1.0, // 공격 예고 후 도착까지
+  warnTime: 1 / 1.5, // 공격 발사 후 도착까지. 던지는 속도를 1.5배로 올렸다
+  laserSpeed: 150, // 레이저가 날아가는 속도 (m/s)
+  laserLen: 30, // 레이저 광선 한 줄기의 길이 (m)
   winShowTime: 3,
   viewMeters: 36, // 주행 화면 너비에 보이는 거리
   accel: 2.4, // 속도 배율 변화율(/초). 부스터·감속이 약 0.25초에 걸쳐 반영된다
@@ -22,6 +24,7 @@ const CONFIG = {
   catchMax: 0.1, // 여기까지만 올린다
   camLag: 0.25, // 기본 속도 초과분 1m/s당 카메라가 뒤처지는 거리 (m)
   boostZoom: 0.08, // 부스터 때 줌아웃 비율
+  volume: 0.5, // 전체 음량
 };
 const OFF_MAX = (CONFIG.offMax - CONFIG.offMin) * CONFIG.viewMeters;
 const LAG_MAX = (CONFIG.boostMul - 1) * CONFIG.baseSpeed * CONFIG.camLag;
@@ -54,6 +57,7 @@ const game = {
   players: [],
   items: [],
   shots: [],
+  beams: [],
   fx: [],
   dust: [],
   contacts: new Set(), // 맞닿아 있는 카트 쌍
@@ -119,6 +123,124 @@ function text(str, x, y, size, color = INK, align = 'center', outline) {
   ctx.fillText(str, x, y);
 }
 
+// ---------- 소리 ----------
+
+// 소리는 모두 Web Audio로 합성한다. 한 기기를 같이 쓰므로 엔진음은 하나만 두고 전체 평균 속도를 따라간다.
+let ac = null;
+let master = null;
+let noiseBuf = null;
+let engine = null;
+
+function setupAudio(context) {
+  ac = context;
+  master = ac.createGain();
+  master.gain.value = CONFIG.volume;
+  // 여러 명의 효과음이 겹쳐도 찢어지지 않게 한다.
+  master.connect(ac.createDynamicsCompressor()).connect(ac.destination);
+
+  noiseBuf = ac.createBuffer(1, ac.sampleRate, ac.sampleRate);
+  const data = noiseBuf.getChannelData(0);
+  for (let k = 0; k < data.length; k++) data[k] = Math.random() * 2 - 1;
+
+  // 엔진: 한 옥타브 차이에서 살짝 어긋난 톱니파 두 개가 저역 필터를 지나며 통통거린다.
+  const filter = ac.createBiquadFilter();
+  const gain = ac.createGain();
+  gain.gain.value = 0;
+  filter.connect(gain).connect(master);
+  const oscs = [1, 0.503].map((ratio) => {
+    const osc = ac.createOscillator();
+    osc.type = 'sawtooth';
+    osc.connect(filter);
+    osc.start();
+    return { osc, ratio };
+  });
+  engine = { oscs, filter, gain };
+}
+
+// 브라우저는 사용자 입력 뒤에만 소리를 허용한다. 터치는 손을 뗄 때 허용된다.
+function unlockAudio() {
+  if (!ac) setupAudio(new AudioContext());
+  if (ac.state !== 'running') ac.resume();
+}
+for (const type of ['pointerdown', 'pointerup', 'touchend']) document.addEventListener(type, unlockAudio);
+
+// 카운트다운 중에는 공회전, 경기 중에는 속도 배율만큼 높아지고 그 밖에는 꺼진다.
+function updateEngine() {
+  if (!ac) return;
+  const racing = game.state === 'race';
+  const on = racing || game.state === 'countdown';
+  const mul = racing ? game.players.reduce((sum, p) => sum + p.mul, 0) / game.players.length : 0;
+  const t = ac.currentTime;
+  for (const o of engine.oscs) o.osc.frequency.setTargetAtTime((60 + 50 * mul) * o.ratio, t, 0.05);
+  engine.filter.frequency.setTargetAtTime(300 + 500 * mul, t, 0.05);
+  engine.gain.gain.setTargetAtTime(on ? 0.06 : 0, t, 0.05);
+}
+
+// 주파수가 f0에서 f1로 미끄러지며 잦아드는 음. at은 지금부터의 지연(초)이다.
+function envelope(src, freq, f0, f1, dur, vol, at) {
+  const t = ac.currentTime + at;
+  const g = ac.createGain();
+  freq.setValueAtTime(f0, t);
+  freq.exponentialRampToValueAtTime(f1, t + dur);
+  g.gain.setValueAtTime(vol, t);
+  g.gain.linearRampToValueAtTime(0, t + dur);
+  g.connect(master);
+  src.start(t);
+  src.stop(t + dur);
+  return g;
+}
+
+function tone(type, f0, f1, dur, vol, at = 0) {
+  const osc = ac.createOscillator();
+  osc.type = type;
+  osc.connect(envelope(osc, osc.frequency, f0, f1, dur, vol, at));
+}
+
+// 대역 필터를 지난 잡음. 바람·폭발 소리에 쓴다.
+function noise(f0, f1, dur, vol, at = 0) {
+  const src = ac.createBufferSource();
+  src.buffer = noiseBuf;
+  src.loop = true;
+  const flt = ac.createBiquadFilter();
+  flt.type = 'bandpass';
+  src.connect(flt).connect(envelope(src, flt.frequency, f0, f1, dur, vol, at));
+}
+
+const SOUNDS = {
+  tap: () => tone('triangle', 660, 880, 0.08, 0.3),
+  count: () => tone('square', 440, 440, 0.15, 0.25),
+  go: () => tone('square', 880, 880, 0.5, 0.25),
+  boost: () => {
+    tone('sawtooth', 220, 880, 0.5, 0.12);
+    noise(400, 3000, 0.7, 0.4);
+  },
+  attack: () => {
+    tone('square', 523, 523, 0.08, 0.2);
+    tone('square', 784, 784, 0.12, 0.2, 0.08);
+  },
+  laser: () => {
+    tone('square', 659, 659, 0.08, 0.2);
+    tone('square', 988, 988, 0.12, 0.2, 0.08);
+  },
+  beam: () => {
+    tone('sawtooth', 1800, 200, 0.5, 0.18);
+    tone('square', 900, 120, 0.5, 0.1);
+  },
+  // 공격이 날아가는 동안 떨어지는 휘파람 소리가 난다. 모두가 듣는 공격 예고이기도 하다.
+  fire: () => tone('sine', 1500, 500, CONFIG.warnTime, 0.25),
+  hit: () => {
+    noise(1200, 80, 0.45, 0.8);
+    tone('sawtooth', 200, 40, 0.4, 0.3);
+  },
+  miss: () => noise(2500, 600, 0.25, 0.5),
+  bump: () => tone('sine', 180, 60, 0.12, 0.5),
+  win: () => [523, 659, 784, 1047].forEach((f, k) => tone('square', f, f, k < 3 ? 0.14 : 0.6, 0.22, k * 0.13)),
+};
+
+function sfx(name) {
+  if (ac && ac.state === 'running') SOUNDS[name]();
+}
+
 // ---------- 레이아웃 ----------
 
 function resize() {
@@ -149,7 +271,7 @@ function computeLayout() {
     const h = ch - m * 2;
     const ix = x + inner;
     const iw = w - inner * 2;
-    const driveH = (h - inner * 2) * 0.5;
+    const driveH = (h - inner * 2) * 0.56;
     const btnH = clamp(h * 0.13, 40, 64);
     const padY = y + inner + driveH + btnH + 8;
     panels.push({
@@ -166,7 +288,7 @@ function computeLayout() {
 // 앞코는 원점에서 NOSE만큼 앞이고, 출발선·결승선은 앞코가 닿는 자리에 그린다.
 const NOSE = 56;
 function kartScale(d) {
-  return Math.min((d.h * 0.44) / 136, (d.w * 0.22) / 116);
+  return Math.min((d.h * 0.34) / 136, (d.w * 0.22) / 116);
 }
 
 // 패널 i의 주행 화면 기하. 같은 경기의 패널은 크기가 같으므로 판정에는 패널 0을 쓴다.
@@ -214,11 +336,12 @@ function newRace() {
       // 트랙 위의 실제 위치. 순위·결승·아이템·공격 판정은 모두 이 값을 쓴다.
       get wx() { return this.base + this.off; },
       mul: 0, lag: 0, spin: 0, dustT: 0, row: -2, // row: 마지막으로 아이템을 얻은 줄
-      boost: 0, slow: 0, protect: 0, hitFx: 0, attack: false, touch: null,
+      boost: 0, slow: 0, protect: 0, hitFx: 0, attack: false, laser: false, touch: null,
     };
   });
   game.items = makeItems(game.count);
   game.shots = [];
+  game.beams = [];
   game.fx = [];
   game.dust = [];
   game.contacts.clear();
@@ -234,9 +357,10 @@ function makeItems(n) {
   const cells = n <= 3 ? 2 : 3;
   let wx = 105 + Math.random() * 20;
   for (let row = 0; wx <= CONFIG.raceLength - 100; row++) {
-    // 줄마다 부스터와 공격이 적어도 하나씩 섞인다.
-    const types = ['boost', 'attack'];
-    while (types.length < cells) types.push(Math.random() < 0.5 ? 'boost' : 'attack');
+    // 줄마다 부스터와 무기(공격 또는 레이저)가 적어도 하나씩 섞인다.
+    const weapon = () => (Math.random() < 0.35 ? 'laser' : 'attack');
+    const types = ['boost', weapon()];
+    while (types.length < cells) types.push(Math.random() < 0.5 ? 'boost' : weapon());
     types.sort(() => Math.random() - 0.5);
     types.forEach((type, c) => {
       items.push({ wx, lat: (c + 0.5 + (Math.random() - 0.5) * 0.4) / cells, type, row, takenBy: null });
@@ -249,6 +373,7 @@ function makeItems(n) {
 function startCountdown() {
   game.state = 'countdown';
   game.countdown = 3;
+  sfx('count');
   show(null);
 }
 
@@ -273,11 +398,15 @@ function update(dt) {
   if (game.state === 'countdown') {
     // 카운트다운 중에는 좌우로만 움직인다. 전후 목표는 출발 뒤에 반영된다.
     moveKarts(dt, false);
+    const before = Math.ceil(game.countdown);
     game.countdown -= dt;
     if (game.countdown <= 0) {
       game.state = 'race';
       game.goFlash = 0.7;
+      sfx('go');
       launch();
+    } else if (Math.ceil(game.countdown) < before) {
+      sfx('count');
     }
   } else if (game.state === 'race') {
     updateRace(dt);
@@ -330,6 +459,7 @@ function bumpKarts(v) {
       if (!game.contacts.has(key)) {
         game.contacts.add(key);
         game.fx.push({ kind: 'bump', to: a, u: (A.wx + B.wx) / 2 - A.base, lat: (A.lat + B.lat) / 2, t: 0 });
+        sfx('bump');
       }
       // 반씩 밀려나고, 도로 가장자리에 막힌 만큼은 상대가 더 밀려난다.
       const dir = dl >= 0 ? 1 : -1;
@@ -370,6 +500,7 @@ function updateRace(dt) {
     }
   }
   takeItems(v);
+  updateBeams(dt, v);
 
   for (const s of game.shots) s.t += dt;
   for (const s of game.shots.filter((s) => s.t >= CONFIG.warnTime)) resolveShot(s);
@@ -385,9 +516,12 @@ function updateRace(dt) {
 }
 
 // 앞선 카트들이 매 줄을 쓸어가면 뒤쪽은 빈 줄만 만난다. 그래서 아이템을 얻은 카트는
-// 그 줄의 다른 칸과 바로 다음 줄을 얻지 못한다. 공격을 이미 가진 카트는 공격 칸을 소비하지 않고 지나간다.
+// 그 줄의 다른 칸과 바로 다음 줄을 얻지 못한다. 1등은 부스터를 먹지 못한다.
+// 무기(공격·레이저)는 하나만 가질 수 있어서, 무기를 가진 카트는 무기 칸을 소비하지 않고 지나간다.
 function canTake(p, item) {
-  return item.row > p.row + 1 && !(item.type === 'attack' && p.attack);
+  if (item.row <= p.row + 1) return false;
+  if (item.type === 'boost') return rankOf(p) > 1;
+  return !p.attack && !p.laser;
 }
 
 // 같은 프레임에 여러 카트가 닿으면 칸 중심에 가까운 카트, 그래도 같으면 앞선 카트가 가져간다.
@@ -413,8 +547,9 @@ function takeItems(v) {
     item.takenBy = best.i;
     best.row = item.row;
     if (item.type === 'boost') best.boost = CONFIG.boostTime;
-    else best.attack = true;
+    else best[item.type] = true;
     game.fx.push({ kind: 'pick', wx: item.wx, lat: item.lat, by: best.i, t: 0 });
+    sfx(item.type);
   }
 }
 
@@ -424,6 +559,7 @@ function fire(p, target) {
   p.attack = false;
   const t = game.players[target];
   game.shots.push({ from: p.i, to: target, u: t.off, v: t.lat, t: 0 });
+  sfx('fire');
 }
 
 // 투사체의 출발점. 공격자가 대상 화면 밖이면 공격자가 있는 쪽 가장자리에서 들어온다.
@@ -446,6 +582,39 @@ function resolveShot(s) {
     p.hitFx = 0.6;
   }
   game.fx.push({ kind: hitNow ? 'hit' : 'miss', to: s.to, u: s.u, lat: s.v, t: 0 });
+  sfx(hitNow ? 'hit' : 'miss');
+}
+
+// 레이저는 쏜 자리에서 자기 줄(lat)을 따라 결승선 끝까지 곧게 날아간다. 그 줄에 있는 앞쪽 카트는 모두 맞는다.
+// 쏜 순간 뒤에 있던 카트는 맞지 않는다.
+function fireLaser(p) {
+  if (!p.laser) return;
+  p.laser = false;
+  const passed = new Set(game.players.filter((q) => q.wx <= p.wx).map((q) => q.i));
+  game.beams.push({ from: p.i, x0: p.wx, lat: p.lat, t: 0, passed });
+  sfx('beam');
+}
+
+const beamFront = (b) => b.x0 + CONFIG.laserSpeed * b.t;
+
+// 광선 앞머리가 카트를 지나는 순간 그 카트가 광선 줄에 있으면 맞는다.
+function updateBeams(dt, v) {
+  const band = (26 * v.s) / v.rh;
+  for (const b of game.beams) {
+    b.t += dt;
+    const front = beamFront(b);
+    for (const p of game.players) {
+      if (b.passed.has(p.i) || p.wx > front) continue;
+      b.passed.add(p.i);
+      if (Math.abs(p.lat - b.lat) >= band || p.protect > 0) continue;
+      p.slow = CONFIG.slowTime;
+      p.protect = CONFIG.protectTime;
+      p.hitFx = 0.6;
+      game.fx.push({ kind: 'hit', to: p.i, u: p.off, lat: p.lat, t: 0 });
+      sfx('hit');
+    }
+  }
+  game.beams = game.beams.filter((b) => beamFront(b) - CONFIG.laserLen < CONFIG.raceLength + 20);
 }
 
 function finish(winners) {
@@ -454,7 +623,9 @@ function finish(winners) {
   game.winners = winners.map((p) => p.i);
   for (const p of winners) game.wins[p.i]++;
   game.shots = [];
+  game.beams = [];
   releaseInput();
+  sfx('win');
 }
 
 // ---------- 화면 전환 ----------
@@ -469,6 +640,7 @@ function show(id) {
 function tap(id, fn) {
   $(id).addEventListener('pointerdown', (e) => {
     e.preventDefault();
+    sfx('tap');
     fn();
   });
 }
@@ -484,16 +656,14 @@ function showResult() {
   const names = game.winners.map((i) => PLAYERS[i].name);
   $('resultTitle').textContent = names.join(' · ') + (names.length > 1 ? ' 공동 Win!' : ' Win!');
   $('resultTitle').style.color = PLAYERS[game.winners[0]].color;
-  const sorted = [...game.players].sort((a, b) => b.wx - a.wx);
-  $('resultList').innerHTML = sorted
-    .map((p) => {
-      const P = PLAYERS[p.i];
-      const rec = p.wx >= CONFIG.raceLength ? '완주' : `미완주 · ${Math.floor(p.wx)}m`;
-      return `<li><span>${rankOf(p)}위</span><span class="badge" style="background:${P.color}">${p.i + 1}</span>` +
-        `<span>${P.name}</span><span class="rec">${rec}</span><span class="wins">${game.wins[p.i]} Win</span></li>`;
-    })
-    .join('');
   show('result');
+}
+
+// 시상대에 오를 순서. 인원수만큼(최대 6등) 나온다.
+function standings() {
+  return [...game.players]
+    .sort((a, b) => b.wx - a.wx)
+    .map((p) => ({ p, rank: rankOf(p), rec: p.wx >= CONFIG.raceLength ? '완주' : `${Math.floor(p.wx)}m` }));
 }
 
 function askTitle(from) {
@@ -511,6 +681,7 @@ tap('btnStart', () => {
 for (const b of $('counts').children) {
   b.addEventListener('pointerdown', (e) => {
     e.preventDefault();
+    sfx('tap');
     game.selected = Number(b.dataset.n);
     updateSelect();
   });
@@ -569,7 +740,10 @@ canvas.addEventListener('pointerdown', (e) => {
   e.preventDefault();
   if (game.state !== 'race' && game.state !== 'countdown') return;
   const { x, y } = pointerPos(e);
-  if (hit(game.layout.pauseBtn, x, y)) return pause();
+  if (hit(game.layout.pauseBtn, x, y)) {
+    sfx('tap');
+    return pause();
+  }
 
   // 터치는 처음 닿은 패널에 귀속되고, 조향인지 공격인지도 이때 정해진다.
   const pi = game.layout.panels.findIndex((pan, i) => i < game.count && hit(pan, x, y));
@@ -577,7 +751,11 @@ canvas.addEventListener('pointerdown', (e) => {
   const pan = game.layout.panels[pi];
   const p = game.players[pi];
   const btn = attackButtons(pan, pi).find((b) => hit(b, x, y));
-  if (btn) {
+  if (p.laser && hit(pan.btns, x, y)) {
+    // 레이저를 가지고 있으면 버튼 줄 전체가 레이저 발사 버튼이 된다.
+    if (game.state === 'race') fireLaser(p);
+    game.pointers.set(e.pointerId, { player: pi, kind: 'attack' });
+  } else if (btn) {
     if (game.state === 'race') fire(p, btn.target);
     game.pointers.set(e.pointerId, { player: pi, kind: 'attack' });
   } else if (hit(pan.pad, x, y)) {
@@ -607,7 +785,9 @@ canvas.addEventListener('pointerup', pointerEnd);
 canvas.addEventListener('pointercancel', pointerEnd);
 
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) pause();
+  if (!document.hidden) return;
+  pause();
+  updateEngine(); // 가려지면 프레임이 멈추므로 엔진음을 여기서 끈다
 });
 for (const type of ['touchmove', 'gesturestart', 'contextmenu', 'dblclick']) {
   document.addEventListener(type, (e) => e.preventDefault(), { passive: false });
@@ -638,6 +818,38 @@ function hand(x, y, r) {
   ctx.arc(x, y, r, 0, Math.PI * 2);
   ctx.fill();
   ctx.stroke();
+}
+
+// 얼굴: ∧ ∧ 눈과 ω 입. 슬프면 물결 입과 눈물. fx는 얼굴 중심 x, hy는 머리 중심 y다.
+function drawFace(fx, hy, sad) {
+  const t = game.time;
+  ctx.lineWidth = 2.5;
+  for (const ex of [fx - 8, fx + 10]) {
+    ctx.beginPath();
+    ctx.moveTo(ex - 5, hy + 1);
+    ctx.lineTo(ex, hy - 9);
+    ctx.lineTo(ex + 5, hy + 1);
+    ctx.stroke();
+  }
+  if (sad) {
+    ctx.beginPath();
+    ctx.moveTo(fx - 4, hy + 13);
+    ctx.quadraticCurveTo(fx - 1, hy + 8, fx + 2, hy + 12);
+    ctx.quadraticCurveTo(fx + 5, hy + 15, fx + 8, hy + 11);
+    ctx.stroke();
+    ctx.fillStyle = '#4aa3f0';
+    for (const [tx, ty] of [[fx - 9, hy + 8], [fx + 12, hy + 9]]) {
+      ctx.beginPath();
+      ctx.ellipse(tx, ty + Math.abs(Math.sin(t * 3)) * 3, 2.6, 4, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  } else {
+    for (const mx of [fx - 3.5, fx + 5.5]) {
+      ctx.beginPath();
+      ctx.arc(mx, hy + 8, 4.5, 0, Math.PI);
+      ctx.stroke();
+    }
+  }
 }
 
 // pose: 'drive' | 'win' | 'lose'. 원점은 바퀴 바닥 중앙, 오른쪽을 향한다.
@@ -751,35 +963,7 @@ function drawKart(x, y, s, color, pose, o = {}) {
   ctx.fill();
   ctx.stroke();
 
-  // 얼굴: ∧ ∧ 눈과 ω 입
-  const fx = hx + 5;
-  ctx.lineWidth = 2.5;
-  for (const ex of [fx - 8, fx + 10]) {
-    ctx.beginPath();
-    ctx.moveTo(ex - 5, hy + 1);
-    ctx.lineTo(ex, hy - 9);
-    ctx.lineTo(ex + 5, hy + 1);
-    ctx.stroke();
-  }
-  if (pose === 'lose') {
-    ctx.beginPath();
-    ctx.moveTo(fx - 4, hy + 13);
-    ctx.quadraticCurveTo(fx - 1, hy + 8, fx + 2, hy + 12);
-    ctx.quadraticCurveTo(fx + 5, hy + 15, fx + 8, hy + 11);
-    ctx.stroke();
-    ctx.fillStyle = '#4aa3f0';
-    for (const [tx, ty] of [[fx - 9, hy + 8], [fx + 12, hy + 9]]) {
-      ctx.beginPath();
-      ctx.ellipse(tx, ty + Math.abs(Math.sin(t * 3)) * 3, 2.6, 4, 0, 0, Math.PI * 2);
-      ctx.fill();
-    }
-  } else {
-    for (const mx of [fx - 3.5, fx + 5.5]) {
-      ctx.beginPath();
-      ctx.arc(mx, hy + 8, 4.5, 0, Math.PI);
-      ctx.stroke();
-    }
-  }
+  drawFace(hx + 5, hy, pose === 'lose');
 
   // 팔과 손
   ctx.lineWidth = 3;
@@ -832,6 +1016,65 @@ function drawKart(x, y, s, color, pose, o = {}) {
       ctx.fill();
       ctx.stroke();
     }
+  }
+  ctx.restore();
+}
+
+// 시상대에 선 캐릭터. 원점은 발 아래 중앙이고 높이 약 150 단위다.
+// pose: 'win'(두 팔 번쩍·왕관) | 'wave'(한 손 흔들기) | 'cry'(두 손으로 눈물 닦기)
+function drawBuddy(x, y, s, color, pose) {
+  const t = game.time;
+  const jump = pose === 'win' ? Math.abs(Math.sin(t * 6)) * 8 : 0;
+  ctx.save();
+  ctx.translate(x, y - jump * s);
+  ctx.scale(s, s);
+  ctx.lineWidth = 3;
+  ctx.lineJoin = ctx.lineCap = 'round';
+  ctx.strokeStyle = INK;
+
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(-24, 0);
+  ctx.quadraticCurveTo(-26, -58, -10, -76);
+  ctx.lineTo(10, -76);
+  ctx.quadraticCurveTo(26, -58, 24, 0);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+
+  const hy = -100;
+  ctx.fillStyle = '#fffaf0';
+  ctx.beginPath();
+  ctx.arc(0, hy, 27, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+  drawFace(0, hy, pose === 'cry');
+
+  ctx.lineWidth = 3;
+  const arm = (sx, cx, cy, ex, ey, r = 8) => {
+    ctx.beginPath();
+    ctx.moveTo(sx, -62);
+    ctx.quadraticCurveTo(cx, cy, ex, ey);
+    ctx.stroke();
+    hand(ex, ey, r);
+  };
+  if (pose === 'win') {
+    arm(-14, -40, -80, -38, -138, 9);
+    arm(14, 40, -80, 38, -138, 9);
+    ctx.fillStyle = '#ffd84a';
+    ctx.beginPath();
+    ctx.moveTo(-18, hy - 22);
+    for (const [cx, cy] of [[-18, -48], [-9, -34], [0, -52], [9, -34], [18, -48], [18, -22]]) ctx.lineTo(cx, hy + cy);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+  } else if (pose === 'wave') {
+    const a = Math.sin(t * 8) * 10;
+    arm(-14, -30, -50, -30, -20);
+    arm(14, 44, -80, 40 + a, -132);
+  } else {
+    arm(-14, -34, -70, -12, hy + 10);
+    arm(14, 34, -70, 16, hy + 10);
   }
   ctx.restore();
 }
@@ -945,10 +1188,22 @@ function drawItem(type, x, y, s) {
   ctx.strokeStyle = INK;
   ctx.lineJoin = 'round';
   rr(-26, -26, 52, 52, 8);
-  ctx.fillStyle = type === 'boost' ? '#ffe9a3' : '#ffc9c2';
+  ctx.fillStyle = { boost: '#ffe9a3', attack: '#ffc9c2', laser: '#c9e8ff' }[type];
   ctx.fill();
   ctx.stroke();
-  if (type === 'boost') {
+  if (type === 'laser') {
+    // 광선 두 줄이 별에 부딪히는 모양
+    ctx.strokeStyle = '#2f7be0';
+    ctx.lineWidth = 4;
+    line(-20, -6, 4, -6);
+    line(-20, 6, 4, 6);
+    spiky(12, 0, 12, 5, 7, game.time * 2);
+    ctx.fillStyle = '#ffe066';
+    ctx.strokeStyle = INK;
+    ctx.lineWidth = 2.5;
+    ctx.fill();
+    ctx.stroke();
+  } else if (type === 'boost') {
     ctx.strokeStyle = '#e8801a';
     ctx.lineWidth = 5;
     for (const ax of [-14, -2, 10]) {
@@ -1102,6 +1357,31 @@ function drawDrive(d, me) {
     if (onScreen(x)) drawProjectile(x, y, s, PLAYERS[sh.from].color);
   }
 
+  // 레이저 광선: 쏜 사람 색의 굵은 빛줄기와 흰 심지
+  for (const b of game.beams) {
+    const front = beamFront(b);
+    const x0 = xOf(Math.max(b.x0, front - CONFIG.laserLen));
+    const x1 = xOf(front);
+    if (zx(x1) < d.x - 80 * s || zx(x0) > d.x + d.w + 80 * s) continue;
+    const y = yOf(b.lat) - 30 * s;
+    ctx.strokeStyle = PLAYERS[b.from].color;
+    ctx.globalAlpha = 0.45;
+    ctx.lineWidth = 18 * s;
+    line(x0, y, x1, y);
+    ctx.globalAlpha = 1;
+    ctx.lineWidth = 8 * s;
+    line(x0, y, x1, y);
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 3 * s;
+    line(x0, y, x1, y);
+    spiky(x1, y, 16 * s, 7 * s, 8, game.time * 20);
+    ctx.fillStyle = '#ffe066';
+    ctx.strokeStyle = INK;
+    ctx.lineWidth = Math.max(1.5, 2.5 * s);
+    ctx.fill();
+    ctx.stroke();
+  }
+
   for (const f of game.fx) {
     const ix = xOf(f.to === undefined ? f.wx : game.players[f.to].base + f.u);
     if (!onScreen(ix)) continue;
@@ -1176,6 +1456,21 @@ function drawDrive(d, me) {
     }
   }
 
+  // 뒤에서 내 쪽으로 오는 레이저 경고. 광선 줄 높이의 왼쪽 가장자리에 띄운다.
+  for (const b of game.beams) {
+    const gap = me.wx - beamFront(b);
+    if (b.passed.has(me.i) || gap < 0 || gap > 80 || Math.sin(game.time * 25) <= -0.3) continue;
+    const wx = d.x + es * 6 + 24 * s;
+    const wy = clamp(yOf(b.lat) - 30 * s, d.y + fs * 2 + 22 * s, bottom - 24 * s);
+    spiky(wx, wy, 20 * s, 13 * s, 8);
+    ctx.fillStyle = '#c9e8ff';
+    ctx.fill();
+    ctx.strokeStyle = INK;
+    ctx.lineWidth = Math.max(1.5, 2.5 * s);
+    ctx.stroke();
+    text('!', wx, wy + s, 24 * s, '#2f7be0');
+  }
+
   // 시야 밖 상대: 있는 쪽 가장자리에 번호와 거리 차를 보여준다.
   const lastY = { '-1': 0, 1: 0 };
   for (const q of [...game.players].sort((a, b) => a.lat - b.lat)) {
@@ -1223,7 +1518,21 @@ function drawDrive(d, me) {
 
 // ---------- 그리기: 조작 공간 ----------
 
+// 레이저를 가지고 있으면 버튼 줄 전체가 레이저 발사 버튼이다.
+function drawLaserButton(b) {
+  const armed = game.state === 'race';
+  rr(b.x, b.y + 2, b.w, b.h - 4, 10);
+  ctx.fillStyle = '#c9e8ff';
+  ctx.fill();
+  ctx.strokeStyle = armed ? INK : 'rgba(43,38,34,.3)';
+  ctx.lineWidth = 2 + (armed ? 1.5 + Math.sin(game.time * 10) * 1.5 : 0);
+  ctx.stroke();
+  drawItem('laser', b.x + b.h * 0.85, b.y + b.h / 2, (b.h * 0.8) / 52 / 0.55);
+  text('레이저 발사!', b.x + b.w / 2 + b.h * 0.4, b.y + b.h / 2 + 1, Math.min(b.h * 0.5, b.w * 0.09), '#2f7be0', 'center', '#fff');
+}
+
 function drawButtons(pan, p) {
+  if (p.laser) return drawLaserButton(pan.btns);
   const b = pan.btns;
   const armed = p.attack && game.state === 'race';
   const cx = b.x + b.h * 0.55;
@@ -1298,7 +1607,7 @@ function drawHelpCell(pan) {
   ctx.setLineDash([8, 6]);
   ctx.stroke();
   ctx.setLineDash([]);
-  const lines = ['조작 안내', '터치 화면에 손가락 → 카트 이동', '≫ 부스터: 빨라져요', '✸ 공격 칸 → 상대 번호 터치', '아이템은 먼저 밟은 사람 것!', '날아오는 공격은 피하기!'];
+  const lines = ['조작 안내', '터치 화면에 손가락 → 카트 이동', '≫ 부스터: 빨라져요 (1등은 못 먹어요)', '✸ 공격 칸 → 상대 번호 터치', '레이저 칸 → 레이저 발사! 앞쪽 끝까지', '날아오는 공격은 피하기!'];
   const fs = clamp(Math.min(pan.h * 0.075, pan.w * 0.055), 11, 24);
   lines.forEach((ln, k) => {
     text(ln, pan.x + pan.w / 2, pan.y + pan.h / 2 + (k - 2.5) * fs * 1.7, k ? fs : fs * 1.3, k ? 'rgba(43,38,34,.75)' : INK);
@@ -1385,6 +1694,39 @@ function drawRaceScreen() {
   else if (game.state === 'race' && game.goFlash > 0) drawCenterCall('출발!');
 }
 
+// 레이스가 끝나고 3초 뒤 나오는 시상대. 1등이 가운데, 2등은 왼쪽, 3등은 오른쪽, 그다음은 바깥쪽으로 번갈아 선다.
+function drawPodium() {
+  const list = standings();
+  const cols = [];
+  list.forEach((e, k) => (k % 2 ? cols.unshift(e) : cols.push(e)));
+  const n = cols.length;
+  const slotW = Math.min((W * 0.92) / n, H * 0.34);
+  const left = (W - slotW * n) / 2;
+  const baseY = H * 0.68;
+  const topH = H * 0.2;
+  const cs = Math.min((slotW * 0.75) / 90, (H * 0.22) / 150);
+  const fs = clamp(slotW * 0.13, 12, 26);
+  ctx.lineJoin = ctx.lineCap = 'round';
+  ctx.strokeStyle = INK;
+  ctx.lineWidth = 3;
+  line(left - 10, baseY, left + slotW * n + 10, baseY);
+  cols.forEach(({ p, rank, rec }, k) => {
+    const P = PLAYERS[p.i];
+    const cx = left + slotW * (k + 0.5);
+    const h = topH * (1 - (rank - 1) * 0.14);
+    rr(cx - slotW * 0.44, baseY - h, slotW * 0.88, h, 6);
+    ctx.fillStyle = rank === 1 ? '#ffe27a' : '#fff';
+    ctx.fill();
+    ctx.strokeStyle = INK;
+    ctx.lineWidth = 3;
+    ctx.stroke();
+    text(String(rank), cx, baseY - h / 2, Math.min(h * 0.6, slotW * 0.5), INK);
+    drawBuddy(cx, baseY - h, cs, P.color, rank === 1 ? 'win' : rank === 2 ? 'wave' : 'cry');
+    text(P.name, cx, baseY + fs * 0.9, fs, P.color, 'center', PAPER);
+    text(`${rec} · ${game.wins[p.i]} Win`, cx, baseY + fs * 2, fs * 0.75, INK);
+  });
+}
+
 function drawTitleScene() {
   const s = Math.min((H * 0.42) / 136, (W * 0.25) / 116);
   const roadTop = H * 0.9 - 70 * s;
@@ -1398,6 +1740,7 @@ function render() {
   ctx.fillStyle = PAPER;
   ctx.fillRect(0, 0, W, H);
   if (game.state === 'title' || game.state === 'select') drawTitleScene();
+  else if (game.state === 'result') drawPodium();
   else drawRaceScreen();
 }
 
@@ -1408,6 +1751,7 @@ function frame(now) {
   const dt = Math.min(0.05, (now - last) / 1000);
   last = now;
   update(dt);
+  updateEngine();
   render();
   requestAnimationFrame(frame);
 }
